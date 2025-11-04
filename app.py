@@ -1,179 +1,183 @@
 import os
-print("✅ STARTUP: app.py запущен!")
-print("✅ TELEGRAM_TOKEN:", os.getenv("TELEGRAM_TOKEN"))
-print("✅ TELEGRAM_CHAT_ID:", os.getenv("TELEGRAM_CHAT_ID"))
-import os
-import asyncio
-import aiohttp
-from aiohttp import web
-import json
-import logging
+import time
+import threading
 import hashlib
 import requests
 from bs4 import BeautifulSoup
-from threading import Thread
-from time import sleep
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("bg_status_bot")
+# ====== НАСТРОЙКИ ======
+TELEGRAM_TOKEN = os.getenv("8130372610:AAEpWmaVAR7-5q42K6fD7NU0rBEuvDKeCYI") or "PUT_YOUR_TOKEN_HERE"
+TELEGRAM_CHAT_ID = os.getenv("6094061742") or "PUT_CHAT_ID_HERE"
 
-# ==== CONFIG ====
-TELEGRAM_TOKEN = os.environ.get("8130372610:AAEpWmaVAR7-5q42K6fD7NU0rBEuvDKeCYI")
-TELEGRAM_CHAT_ID = os.environ.get("6094061742")
-
+# твои заявления
 CLAIMS = [
     {"num": "23859/2023", "pin": "339020"},
     {"num": "23860/2023", "pin": "265854"},
 ]
 
-CHECK_INTERVAL = 8 * 60 * 60  # 8 часов
-SAVE_PATH = "/tmp/status_cache.json"
+# проверка раз в 8 часов
+CHECK_INTERVAL = 8 * 60 * 60
+# файл чтобы помнить прошлые статусы
+STATE_FILE = "status_cache.txt"
+
+# правильный URL (как ты нашёл)
+CHECK_URL = "https://publicbg.mjs.bg/BgInfo/BG/Web/RegisterPublic"
 
 
-# ==== HELPERS ====
-def send_telegram(text: str):
-    """Отправка сообщения в Telegram"""
+# ====== УТИЛИТЫ ======
+def tg_send(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[tg] TOKEN or CHAT_ID not set")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID.strip(), "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(url, data=payload, timeout=10)
+        r = requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+        if not r.ok:
+            print("[tg] error:", r.text)
     except Exception as e:
-        logger.warning("Telegram send failed: %s", e)
+        print("[tg] exception:", e)
 
 
 def load_state():
+    data = {}
+    if not os.path.exists(STATE_FILE):
+        return data
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            num, status = line.split("::", 1)
+            data[num] = status
+    return data
+
+
+def save_state(state: dict):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        for k, v in state.items():
+            f.write(f"{k}::{v}\n")
+
+
+# ====== ЛОГИКА ПРОВЕРКИ ======
+def fetch_status(num: str, pin: str) -> str:
+    """запрашиваем статус у болгар"""
     try:
-        with open(SAVE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_state(state):
-    try:
-        with open(SAVE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-# ==== CORE ====
-async def fetch_status(session, claim):
-    """Запрос статуса с сайта Минюста Болгарии (исправленный URL)"""
-    num = claim["num"]
-    pin = claim["pin"]
-
-    try:
-        url = "https://publicbg.mjs.bg/BgInfo/BG/Web/RegisterPublic"
-        data = {
-            "number": num.split("/")[0],
-            "year": num.split("/")[1],
-            "pin": pin
-        }
-        async with session.post(url, data=data, timeout=30) as resp:
-            html = await resp.text()
-
+        number, year = num.split("/")
+        resp = requests.post(
+            CHECK_URL,
+            data={"number": number, "year": year, "pin": pin},
+            timeout=20,
+        )
+        html = resp.text
         soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(separator=" ").lower()
+        text = soup.get_text(" ").lower()
 
         if "задължително съгласуване" in text:
             return "В процедура по задължително съгласуване"
-        elif "предложена за издаване на указ" in text:
+        if "предложена за издаване на указ" in text:
             return "Предложена за указ"
-        elif "издаден указ" in text:
+        if "издаден указ" in text:
             return "Издаден указ"
-        else:
-            # fallback для любых новых формулировок
-            return "HASH_" + hashlib.md5(text.encode("utf-8")).hexdigest()
+
+        # если текст новый/другой
+        return "HASH_" + hashlib.md5(text.encode("utf-8")).hexdigest()
 
     except Exception as e:
-        logger.warning("Fetch failed for %s: %s", num, e)
         return f"error:{e}"
 
-async def check_all(app, manual=False):
-    """Проверка всех заявлений"""
+
+def check_all(manual=False):
+    """проверяем все заявления, сравниваем с прошлым состоянием"""
+    print("[check] start (manual=" + str(manual) + ")")
     state = load_state()
-    async with aiohttp.ClientSession() as session:
-        text_out = []
-        for claim in CLAIMS:
-            num = claim["num"]
-            status = await fetch_status(session, claim)
-            prev = state.get(num)
-            if prev != status:
-                msg = (
-                    f"⚡️ *Изменение статуса заявления {num}*\n\n"
-                    f"Было: `{prev}`\n"
-                    f"Стало: `{status}`"
-                )
-                send_telegram(msg)
-                state[num] = status
-                save_state(state)
-            text_out.append(f"{num} — {status}")
-        if manual:
-            send_telegram("📋 *Результаты ручной проверки:*\n\n" + "\n".join(text_out))
+    out_lines = []
+    changed = False
+
+    for claim in CLAIMS:
+        num = claim["num"]
+        pin = claim["pin"]
+        status = fetch_status(num, pin)
+        prev = state.get(num)
+
+        out_lines.append(f"{num} — {status}")
+
+        if prev != status:
+            changed = True
+            state[num] = status
+            # уведомляем об изменении
+            tg_send(
+                f"⚡️ Статус заявления *{num}* изменился.\nБыло: `{prev}`\nСтало: `{status}`"
+            )
+
     save_state(state)
 
+    # если это ручная проверка — шлём результат даже без изменений
+    if manual:
+        tg_send("📋 Ручная проверка:\n" + "\n".join(out_lines))
 
-async def periodic_checker(app):
-    """Автоматическая проверка каждые 8 часов"""
-    await asyncio.sleep(5)
-    send_telegram("✅ Бот запущен и работает. Проверка каждые 8 часов.")
+    print("[check] done")
+
+
+# ====== ПОТОК АВТОПРОВЕРКИ ======
+def auto_checker():
+    # при старте один раз проверим и скажем что живы
+    tg_send("✅ Бот запущен на сервере. Буду проверять каждые 8 часов.")
+    check_all(manual=False)
     while True:
-        try:
-            await check_all(app)
-        except Exception as e:
-            logger.warning("Loop error: %s", e)
-        await asyncio.sleep(CHECK_INTERVAL)
+        time.sleep(CHECK_INTERVAL)
+        check_all(manual=False)
 
 
-# ==== TELEGRAM COMMAND HANDLER ====
-def telegram_listener():
-    """Постоянный опрос Telegram, чтобы ловить команду /check"""
+# ====== ПОТОК TELEGRAM POLLING ======
+def telegram_poll():
+    """
+    простой опрос бота: если ты пишешь /check — он делает check_all(manual=True)
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[poll] no token/chat_id, skip polling")
+        return
+
+    print("[poll] telegram polling started")
     offset = None
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-            params = {"timeout": 30, "offset": offset}
+            params = {"timeout": 30}
+            if offset:
+                params["offset"] = offset
             r = requests.get(url, params=params, timeout=35)
             data = r.json()
-            if "result" in data:
-                for upd in data["result"]:
-                    offset = upd["update_id"] + 1
-                    msg = upd.get("message", {})
-                    chat_id = str(msg.get("chat", {}).get("id"))
-                    text = msg.get("text", "").strip().lower()
-                    if chat_id == TELEGRAM_CHAT_ID and text == "/check":
-                        loop = asyncio.get_event_loop()
-                        loop.create_task(check_all(None, manual=True))
+
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = str(chat.get("id", ""))
+                text = (msg.get("text") or "").strip()
+
+                # реагируем только на твой чат
+                if chat_id == str(TELEGRAM_CHAT_ID):
+                    if text.lower() == "/check":
+                        check_all(manual=True)
+                    elif text.lower() in ("/start", "привет", "hi"):
+                        tg_send("👋 Я тут. Напиши /check чтобы проверить сейчас.")
         except Exception as e:
-            logger.warning("Telegram listener error: %s", e)
-        sleep(5)
+            print("[poll] error:", e)
+            time.sleep(5)
 
-
-# ==== WEB SERVER ====
-async def health(request):
-    return web.Response(text="ok")
-
-async def start_bg(app):
-    app["task"] = asyncio.create_task(periodic_checker(app))
-    Thread(target=telegram_listener, daemon=True).start()
-
-async def cleanup_bg(app):
-    app["task"].cancel()
-    try:
-        await app["task"]
-    except asyncio.CancelledError:
-        pass
-
-def create_app():
-    app = web.Application()
-    app.router.add_get("/health", health)
-    app.on_startup.append(start_bg)
-    app.on_cleanup.append(cleanup_bg)
-    return app
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    web.run_app(create_app(), host="0.0.0.0", port=port)
+    # запускаем два параллельных потока
+    t1 = threading.Thread(target=auto_checker, daemon=True)
+    t1.start()
+
+    t2 = threading.Thread(target=telegram_poll, daemon=True)
+    t2.start()
+
+    # чтобы главный поток не завершился
+    while True:
+        time.sleep(60)
