@@ -57,12 +57,12 @@ def save_state(state):
 
 # ==== CORE ====
 async def fetch_status(session, claim):
-    """Запрос статуса с сайта Минюста Болгарии"""
+    """Запрос статуса с сайта Минюста Болгарии (исправленный URL)"""
     num = claim["num"]
     pin = claim["pin"]
 
     try:
-        url = "https://publicbg.mjs.bg/BG/Web/RegisterPublic"
+        url = "https://publicbg.mjs.bg/BgInfo/BG/Web/RegisterPublic"
         data = {
             "number": num.split("/")[0],
             "year": num.split("/")[1],
@@ -81,12 +81,12 @@ async def fetch_status(session, claim):
         elif "издаден указ" in text:
             return "Издаден указ"
         else:
+            # fallback для любых новых формулировок
             return "HASH_" + hashlib.md5(text.encode("utf-8")).hexdigest()
 
     except Exception as e:
         logger.warning("Fetch failed for %s: %s", num, e)
         return f"error:{e}"
-
 
 async def check_all(app, manual=False):
     """Проверка всех заявлений"""
