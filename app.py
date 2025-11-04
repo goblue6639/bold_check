@@ -1,4 +1,8 @@
 import os
+print("✅ STARTUP: app.py запущен!")
+print("✅ TELEGRAM_TOKEN:", os.getenv("TELEGRAM_TOKEN"))
+print("✅ TELEGRAM_CHAT_ID:", os.getenv("TELEGRAM_CHAT_ID"))
+import os
 import asyncio
 import aiohttp
 from aiohttp import web
