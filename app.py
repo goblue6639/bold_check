@@ -7,6 +7,8 @@ import logging
 import hashlib
 import requests
 from bs4 import BeautifulSoup
+from threading import Thread
+from time import sleep
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bg_status_bot")
@@ -15,30 +17,27 @@ logger = logging.getLogger("bg_status_bot")
 TELEGRAM_TOKEN = os.environ.get("8130372610:AAEpWmaVAR7-5q42K6fD7NU0rBEuvDKeCYI")
 TELEGRAM_CHAT_ID = os.environ.get("6094061742")
 
-# твои два заявления
 CLAIMS = [
     {"num": "23859/2023", "pin": "339020"},
     {"num": "23860/2023", "pin": "265854"},
 ]
 
-# 3 раза в сутки = каждые 8 часов
-CHECK_INTERVAL = 8 * 60 * 60
+CHECK_INTERVAL = 8 * 60 * 60  # 8 часов
 SAVE_PATH = "/tmp/status_cache.json"
+
 
 # ==== HELPERS ====
 def send_telegram(text: str):
-    """Отправка уведомления в Telegram"""
+    """Отправка сообщения в Telegram"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("TELEGRAM_TOKEN or CHAT_ID not set")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID.strip(), "text": text, "parse_mode": "Markdown"}
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        if not r.ok:
-            logger.warning("Telegram error: %s", r.text)
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
         logger.warning("Telegram send failed: %s", e)
+
 
 def load_state():
     try:
@@ -47,16 +46,18 @@ def load_state():
     except Exception:
         return {}
 
+
 def save_state(state):
     try:
         with open(SAVE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("Save state failed: %s", e)
+    except Exception:
+        pass
+
 
 # ==== CORE ====
 async def fetch_status(session, claim):
-    """Проверка статуса заявления на сайте Минюста Болгарии"""
+    """Запрос статуса с сайта Минюста Болгарии"""
     num = claim["num"]
     pin = claim["pin"]
 
@@ -67,14 +68,12 @@ async def fetch_status(session, claim):
             "year": num.split("/")[1],
             "pin": pin
         }
-
         async with session.post(url, data=data, timeout=30) as resp:
             html = await resp.text()
 
         soup = BeautifulSoup(html, "html.parser")
         text = soup.get_text(separator=" ").lower()
 
-        # поиск ключевых статусов
         if "задължително съгласуване" in text:
             return "В процедура по задължително съгласуване"
         elif "предложена за издаване на указ" in text:
@@ -82,48 +81,82 @@ async def fetch_status(session, claim):
         elif "издаден указ" in text:
             return "Издаден указ"
         else:
-            # если не нашли — хэшируем текст, чтобы ловить изменения
             return "HASH_" + hashlib.md5(text.encode("utf-8")).hexdigest()
 
     except Exception as e:
         logger.warning("Fetch failed for %s: %s", num, e)
         return f"error:{e}"
 
-async def check_loop(app):
+
+async def check_all(app, manual=False):
+    """Проверка всех заявлений"""
     state = load_state()
     async with aiohttp.ClientSession() as session:
-        while True:
-            logger.info("🔍 Checking statuses...")
-            try:
-                for claim in CLAIMS:
-                    num = claim["num"]
-                    status = await fetch_status(session, claim)
-                    prev = state.get(num)
-                    if prev != status:
-                        msg = (
-                            f"⚡️ *Изменение статуса заявления {num}*\n\n"
-                            f"Было: `{prev}`\n"
-                            f"Стало: `{status}`"
-                        )
-                        send_telegram(msg)
-                        state[num] = status
-                        save_state(state)
-                    else:
-                        logger.info("✅ No change for %s (%s)", num, status)
-            except Exception as e:
-                logger.warning("Loop error: %s", e)
+        text_out = []
+        for claim in CLAIMS:
+            num = claim["num"]
+            status = await fetch_status(session, claim)
+            prev = state.get(num)
+            if prev != status:
+                msg = (
+                    f"⚡️ *Изменение статуса заявления {num}*\n\n"
+                    f"Было: `{prev}`\n"
+                    f"Стало: `{status}`"
+                )
+                send_telegram(msg)
+                state[num] = status
+                save_state(state)
+            text_out.append(f"{num} — {status}")
+        if manual:
+            send_telegram("📋 *Результаты ручной проверки:*\n\n" + "\n".join(text_out))
+    save_state(state)
 
-            logger.info(f"⏳ Спим {CHECK_INTERVAL // 3600} часов...\n")
-            await asyncio.sleep(CHECK_INTERVAL)
+
+async def periodic_checker(app):
+    """Автоматическая проверка каждые 8 часов"""
+    await asyncio.sleep(5)
+    send_telegram("✅ Бот запущен и работает. Проверка каждые 8 часов.")
+    while True:
+        try:
+            await check_all(app)
+        except Exception as e:
+            logger.warning("Loop error: %s", e)
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+# ==== TELEGRAM COMMAND HANDLER ====
+def telegram_listener():
+    """Постоянный опрос Telegram, чтобы ловить команду /check"""
+    offset = None
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            params = {"timeout": 30, "offset": offset}
+            r = requests.get(url, params=params, timeout=35)
+            data = r.json()
+            if "result" in data:
+                for upd in data["result"]:
+                    offset = upd["update_id"] + 1
+                    msg = upd.get("message", {})
+                    chat_id = str(msg.get("chat", {}).get("id"))
+                    text = msg.get("text", "").strip().lower()
+                    if chat_id == TELEGRAM_CHAT_ID and text == "/check":
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(check_all(None, manual=True))
+        except Exception as e:
+            logger.warning("Telegram listener error: %s", e)
+        sleep(5)
+
 
 # ==== WEB SERVER ====
 async def health(request):
     return web.Response(text="ok")
 
-async def start_bg_task(app):
-    app["task"] = asyncio.create_task(check_loop(app))
+async def start_bg(app):
+    app["task"] = asyncio.create_task(periodic_checker(app))
+    Thread(target=telegram_listener, daemon=True).start()
 
-async def cleanup_bg_task(app):
+async def cleanup_bg(app):
     app["task"].cancel()
     try:
         await app["task"]
@@ -133,8 +166,8 @@ async def cleanup_bg_task(app):
 def create_app():
     app = web.Application()
     app.router.add_get("/health", health)
-    app.on_startup.append(start_bg_task)
-    app.on_cleanup.append(cleanup_bg_task)
+    app.on_startup.append(start_bg)
+    app.on_cleanup.append(cleanup_bg)
     return app
 
 if __name__ == "__main__":
